@@ -1,7 +1,11 @@
 import os
+import re
+from dataclasses import dataclass, field
 
 import numpy as np
 import torch
+
+_LETTER = re.compile(r"[A-Za-z]")
 
 # CTranslate2 loads cuBLAS lazily from the system. Torch bundles the CUDA 12
 # runtime (cublas64_12.dll, cudart64_12.dll, ...) under torch/lib. Point the
@@ -17,12 +21,50 @@ if os.path.isdir(_torch_lib):
 from faster_whisper import WhisperModel
 
 
-class Translator:
-    """Loads the Kotoba-Whisper-Bilingual model once and translates Japanese speech to English."""
+@dataclass
+class SegmentResult:
+    text: str
+    start: float
+    end: float
+    avg_logprob: float
+    compression_ratio: float
+    no_speech_prob: float
+    temperature: float
 
-    def __init__(self, model_id="kotoba-tech/kotoba-whisper-bilingual-v1.0-faster", compute_type="int8_float16"):
+
+@dataclass
+class TranslateResult:
+    text: str
+    duration: float
+    duration_after_vad: float
+    segments: list = field(default_factory=list)
+
+
+class Translator:
+    """Loads the Kotoba-Whisper-Bilingual model once and translates Japanese speech to English.
+
+    Junk (hallucinated/fragmented) output is filtered using signals the model already
+    computes during decoding (avg log-prob, compression ratio, no-speech prob), plus an
+    optional Silero VAD pass. No extra model or added latency is required.
+    """
+
+    def __init__(
+        self,
+        model_id="kotoba-tech/kotoba-whisper-bilingual-v1.0-faster",
+        compute_type="int8_float16",
+        vad=True,
+        min_words=1,
+        min_logprob=-1.0,
+        max_compression_ratio=2.4,
+        max_temperature=1.0,
+    ):
         self.model_id = model_id
         self.compute_type = compute_type
+        self.vad = vad
+        self.min_words = min_words
+        self.min_logprob = min_logprob
+        self.max_compression_ratio = max_compression_ratio
+        self.max_temperature = max_temperature
         self.model = WhisperModel(model_id, device="cuda", compute_type=compute_type)
         self._warmup()
 
@@ -36,20 +78,63 @@ class Translator:
                 task="translate",
                 beam_size=1,
                 condition_on_previous_text=False,
+                vad_filter=self.vad,
             )
             for _ in segments:
                 pass
         except Exception:
             pass
 
-    def translate(self, audio):
+    def _is_junk(self, seg):
+        text = (seg.text or "").strip()
+        if not text:
+            return True
+        if not _LETTER.search(text):
+            return True
+        if len(text.split()) < self.min_words:
+            return True
+        if seg.avg_logprob is not None and seg.avg_logprob < self.min_logprob:
+            return True
+        if seg.compression_ratio is not None and seg.compression_ratio > self.max_compression_ratio:
+            return True
+        if seg.temperature is not None and seg.temperature >= self.max_temperature:
+            return True
+        return False
+
+    def translate(self, audio, prompt=None):
         audio = np.asarray(audio, dtype=np.float32)
-        segments, _info = self.model.transcribe(
-            audio,
+        kwargs = dict(
             language="en",
             task="translate",
             beam_size=1,
             condition_on_previous_text=False,
+            vad_filter=self.vad,
         )
-        parts = [seg.text.strip() for seg in segments]
-        return " ".join(p for p in parts if p).strip()
+        if prompt:
+            kwargs["initial_prompt"] = prompt
+
+        segments, info = self.model.transcribe(audio, **kwargs)
+
+        parts = []
+        seg_results = []
+        for seg in segments:
+            sr = SegmentResult(
+                text=(seg.text or "").strip(),
+                start=seg.start,
+                end=seg.end,
+                avg_logprob=seg.avg_logprob,
+                compression_ratio=seg.compression_ratio,
+                no_speech_prob=seg.no_speech_prob,
+                temperature=seg.temperature,
+            )
+            seg_results.append(sr)
+            if not self._is_junk(seg):
+                if sr.text:
+                    parts.append(sr.text)
+
+        return TranslateResult(
+            text=" ".join(parts).strip(),
+            duration=info.duration,
+            duration_after_vad=info.duration_after_vad,
+            segments=seg_results,
+        )

@@ -1,0 +1,20 @@
+{
+  "caption_width": 700,
+  "font_size": 28,
+  "font_family": "Segoe UI",
+  "padding": 20,
+  "background_opacity": 75,
+  "background_color": "#101010",
+  "text_color": "#ffffff",
+  "text_alignment": "center",
+  "position": "bottom-center",
+  "margin": 20,
+  "fade_duration": 150,
+  "hide_until_caption": true,
+  "always_on_top": true,
+  "esc_closes": true,
+  "connection_mode": "lan",
+  "server_address": "127.0.0.1:8765",
+  "pairing_code": "",
+  "audio_device": "Speakers (Realtek(R) Audio) [Loopback]"
+}
