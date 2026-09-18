@@ -1,0 +1,10 @@
+# Client-only install: capture system audio + display the caption overlay.
+# Does NOT need Whisper, Torch, CUDA, faster-whisper, or the model weights.
+#
+#   pip install -r requirements-client.txt
+#   python main.py --client
+#   python main.py --server-headless --port 8765   # if the server runs elsewhere
+numpy
+scipy
+PyAudioWPatch
+PyQt5
