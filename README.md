@@ -173,6 +173,7 @@ The model downloads once (~1.5 GB) into the Hugging Face cache on first run.
 - **`Library cublas64_12.dll is not found or cannot be loaded`** — the app already
   points CTranslate2 at the CUDA DLLs bundled with PyTorch (`torch/lib`). If it still
   fails, make sure the PyTorch install actually has `torch\lib\cublas64_12.dll`.
+  pip install --no-deps nvidia-cublas-cu12 nvidia-cuda-runtime-cu12
 - **No output / silence** — confirm audio is actually playing to the selected output
   device. The startup banner prints the loopback device name; use that device for
   playback.

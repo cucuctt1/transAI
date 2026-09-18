@@ -1,22 +1,100 @@
 import os
 import re
+import site
+import sys
 from dataclasses import dataclass, field
 
 import numpy as np
-import torch
+
+try:
+    import torch  # optional: CTranslate2 does not need torch
+except Exception:
+    torch = None
 
 _LETTER = re.compile(r"[A-Za-z]")
 
-# CTranslate2 loads cuBLAS lazily from the system. Torch bundles the CUDA 12
-# runtime (cublas64_12.dll, cudart64_12.dll, ...) under torch/lib. Point the
-# process-local DLL search path at it so CTranslate2 can resolve cuBLAS without
-# touching the existing CUDA/PyTorch installation.
-_torch_lib = os.path.join(os.path.dirname(torch.__file__), "lib")
-_dll_handle = None
-if os.path.isdir(_torch_lib):
-    os.environ["PATH"] = _torch_lib + os.pathsep + os.environ.get("PATH", "")
-    if os.name == "nt" and hasattr(os, "add_dll_directory"):
-        _dll_handle = os.add_dll_directory(_torch_lib)
+# --- CUDA runtime resolution for CTranslate2 ---------------------------------
+# faster-whisper's backend (CTranslate2) is a CUDA-12 build: it loads
+# cublas64_12.dll / cudart64_12.dll lazily on the first inference. If torch bundles
+# a different CUDA major (e.g. cu13 -> cublas64_13.dll) there is no cublas64_12.dll,
+# and CTranslate2 HANGS on the first translate() instead of raising. So collect
+# every directory that can provide the CUDA 12 runtime DLLs and add them to the
+# process-local DLL search path. The torch/CUDA install is not modified.
+
+_DLL_HANDLES = []
+
+
+def _candidate_dll_dirs():
+    dirs = []
+    here = os.path.dirname(os.path.abspath(__file__))
+    # 1) project-local drop-in folder: just copy cublas64_12.dll / cudart64_12.dll here
+    for name in ("cuda12", "dlls"):
+        d = os.path.join(here, name)
+        if os.path.isdir(d):
+            dirs.append(d)
+    # 2) torch's bundled CUDA libs
+    if torch is not None:
+        d = os.path.join(os.path.dirname(torch.__file__), "lib")
+        if os.path.isdir(d):
+            dirs.append(d)
+    # 3) a system CUDA Toolkit install (any v12.x)
+    cuda_base = r"C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA"
+    if os.path.isdir(cuda_base):
+        try:
+            for v in os.listdir(cuda_base):
+                if v.startswith("v12"):
+                    d = os.path.join(cuda_base, v, "bin")
+                    if os.path.isdir(d):
+                        dirs.append(d)
+        except OSError:
+            pass
+    # 4) nvidia-*-cu12 pip wheels: site-packages/nvidia/<pkg>/bin
+    try:
+        roots = list(site.getsitepackages()) + [site.getusersitepackages()]
+    except Exception:
+        roots = []
+    for root in roots:
+        nv = os.path.join(root, "nvidia")
+        if not os.path.isdir(nv):
+            continue
+        for pkg in os.listdir(nv):
+            for sub in ("bin", "lib", os.path.join("bin", "x64")):
+                d = os.path.join(nv, pkg, sub)
+                if os.path.isdir(d):
+                    dirs.append(d)
+    return dirs
+
+
+def _register_cuda_dirs():
+    found = set()
+    for d in _candidate_dll_dirs():
+        try:
+            os.environ["PATH"] = d + os.pathsep + os.environ.get("PATH", "")
+            if os.name == "nt" and hasattr(os, "add_dll_directory"):
+                _DLL_HANDLES.append(os.add_dll_directory(d))
+        except Exception:
+            pass
+        try:
+            for f in os.listdir(d):
+                low = f.lower()
+                if low.startswith("cublas64") or low.startswith("cudart64"):
+                    found.add(low)
+        except Exception:
+            pass
+    return found
+
+
+_CUDA_DLLS = _register_cuda_dirs()
+if os.name == "nt" and "cublas64_12.dll" not in _CUDA_DLLS:
+    _found = ", ".join(sorted(f for f in _CUDA_DLLS if f.startswith("cublas64"))) or "none"
+    print(
+        f"[CUDA] cublas64_12.dll NOT found (found: {_found}).\n"
+        "[CUDA] CTranslate2 is a CUDA-12 build and will HANG on the first inference.\n"
+        "[CUDA] Fix:  pip install nvidia-cublas-cu12 nvidia-cuda-runtime-cu12\n"
+        "[CUDA] Or run the server with --device cpu.",
+        file=sys.stderr,
+        flush=True,
+    )
 
 from faster_whisper import WhisperModel
 
