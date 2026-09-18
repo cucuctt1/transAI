@@ -456,7 +456,7 @@ class ConnectionController(QObject):
         self.server = AudioCaptionServer(self.audio_source, pairing_code=code, log_cb=log_cb)
         self.server.start()
         self.asr = ASREngine(cfg, translator, gpu_name, self.audio_source,
-                             caption_cb=self.server.broadcast, log_cb=log_cb)
+                             caption_cb=self.server.broadcast, log_cb=log_cb, status_cb=log_cb)
         self.asr.start()
         return self.server, get_lan_ip()
 

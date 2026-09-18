@@ -297,7 +297,9 @@ def run_headless_server(args):
     server = AudioCaptionServer(audio_source, port=args.port, pairing_code=args.pairing_code,
                                 log_cb=lambda line: print(line, flush=True))
     server.start()
-    engine = ASREngine(cfg, translator, gpu_name, audio_source, caption_cb=server.broadcast)
+    engine = ASREngine(cfg, translator, gpu_name, audio_source, caption_cb=server.broadcast,
+                       log_cb=lambda line: print(line, flush=True),
+                       status_cb=lambda line: print(line, flush=True))
     engine.start()
     print(f"[SERVER] headless server running on port {args.port} (fixer: {'on' if args.fixer else 'off'})", flush=True)
     try:

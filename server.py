@@ -288,10 +288,22 @@ class StreamingClient:
         self._sock = None
         self._thread = None
         self.connected = False
+        self.frames_sent = 0
+        self.samples_sent = 0
+        self.captions_received = 0
 
     def start(self):
         self._thread = threading.Thread(target=self._run, daemon=True)
         self._thread.start()
+        threading.Thread(target=self._stats_loop, daemon=True).start()
+
+    def _stats_loop(self):
+        while not self._stop.is_set():
+            self._stop.wait(2.0)
+            self.log_cb(
+                f"[CLIENT] connected={self.connected} audio_sent={self.samples_sent / 16000:.1f}s "
+                f"frames={self.frames_sent} captions={self.captions_received}"
+            )
 
     def stop(self):
         self._stop.set()
@@ -311,6 +323,8 @@ class StreamingClient:
             try:
                 data = np.ascontiguousarray(block, dtype=np.float32).tobytes()
                 self._sock.sendall(struct.pack(">I", len(data)) + data)
+                self.frames_sent += 1
+                self.samples_sent += len(data) // 4
             except OSError:
                 pass
 
@@ -337,6 +351,7 @@ class StreamingClient:
                         if msg.get("type") == "caption":
                             self.connected = True
                             self.status_cb(True)
+                            self.captions_received += 1
                             self.caption_cb(msg.get("text", ""))
                         elif msg.get("type") == "ok":
                             self.connected = True

@@ -74,6 +74,11 @@ class ASREngine:
 
         self._stop = threading.Event()
         self._thread = None
+        # pipeline counters (diagnostics)
+        self.snapshots_submitted = 0
+        self.inferences = 0
+        self.rms_skipped = 0
+        self.not_enough_audio = 0
 
     def start(self):
         self._thread = threading.Thread(target=self._run, name="asr-engine", daemon=True)
@@ -112,12 +117,17 @@ class ASREngine:
             while not self._stop.is_set():
                 next_t += self.cfg.whisper_step
                 got = capture.latest(self.cfg.whisper_window)
-                if got is not None:
+                if got is None:
+                    self.not_enough_audio += 1
+                else:
                     audio, audio_end = got
                     rms = float(np.sqrt(np.mean(audio.astype(np.float64) ** 2)))
                     if rms >= self.silence_threshold:
                         scheduler.submit(Snapshot(audio=audio, audio_end=audio_end, id=snapshot_id))
                         snapshot_id += 1
+                        self.snapshots_submitted += 1
+                    else:
+                        self.rms_skipped += 1
                 delay = next_t - time.monotonic()
                 if delay > 0:
                     if self._stop.wait(delay):
@@ -141,6 +151,7 @@ class ASREngine:
                     self.log_cb(f"[ERROR] inference failed: {exc}")
                     res = None
                 dt = time.monotonic() - t0
+                self.inferences += 1
                 monitor.update(live=capture.live_position(), transcribed=job.audio_end,
                                whisper_dur=dt, skipped=scheduler.skipped, pending=scheduler.pending_count)
                 if res is None:
@@ -164,6 +175,7 @@ class ASREngine:
             threading.Thread(target=fixer_loop, name="fixer", daemon=True).start()
 
         last_status_t = 0.0
+        last_pipe_t = 0.0
         while not self._stop.is_set():
             item = whisper_q.get(timeout=0.2)
             monitor.update(live=capture.live_position())
@@ -172,8 +184,19 @@ class ASREngine:
                 state.apply_hypothesis(text)
                 monitor.update(duplicates=state.noop_count)
                 self.caption_cb(state.latest_caption())
-            if self.cfg.enable_latency_monitor and time.monotonic() - last_status_t >= 2.0:
+            now = time.monotonic()
+            if self.cfg.enable_latency_monitor and now - last_status_t >= 2.0:
                 self.status_cb(monitor.status_line())
-                last_status_t = time.monotonic()
+                last_status_t = now
+            if now - last_pipe_t >= 2.0:
+                live = capture.live_position()
+                avail = capture.available_seconds()
+                pipe_state = "ok" if avail >= self.cfg.whisper_window else "WAITING_FOR_AUDIO"
+                self.log_cb(
+                    f"[PIPE] captured={live:.1f}s buffered={avail:.1f}s window={self.cfg.whisper_window:.1f}s "
+                    f"snapshots={self.snapshots_submitted} inferences={self.inferences} "
+                    f"rms_skipped={self.rms_skipped} not_enough_audio={self.not_enough_audio} -> {pipe_state}"
+                )
+                last_pipe_t = now
 
         capture.stop()
