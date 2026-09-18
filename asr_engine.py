@@ -33,16 +33,22 @@ def load_model(
     min_logprob=-1.0,
     max_compression_ratio=2.4,
     max_temperature=1.0,
+    device="cuda",
     log_cb=None,
 ):
     """Load torch + the Whisper model. Call on the main thread, before PyQt5."""
     log = log_cb or (lambda line: print(line, flush=True))
-    import torch
 
-    if not torch.cuda.is_available():
-        raise RuntimeError("CUDA is not available")
-    gpu_name = torch.cuda.get_device_name(0)
-    log(f"GPU: {gpu_name}")
+    if device == "cuda":
+        import torch
+
+        if not torch.cuda.is_available():
+            raise RuntimeError("CUDA is not available (pass --device cpu to run on CPU)")
+        gpu_name = torch.cuda.get_device_name(0)
+    else:
+        gpu_name = "CPU"
+
+    log(f"Device: {gpu_name}")
     log("Loading model (this happens once)...")
 
     from translator import Translator
@@ -55,6 +61,7 @@ def load_model(
         min_logprob=min_logprob,
         max_compression_ratio=max_compression_ratio,
         max_temperature=max_temperature,
+        device=device,
     )
     log("Model loaded.")
     return translator, gpu_name

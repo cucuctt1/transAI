@@ -57,15 +57,19 @@ class Translator:
         min_logprob=-1.0,
         max_compression_ratio=2.4,
         max_temperature=1.0,
+        device="cuda",
     ):
         self.model_id = model_id
+        self.device = device
+        if device == "cpu" and compute_type in ("float16", "int8_float16"):
+            compute_type = "int8"  # float16 is not supported on CPU
         self.compute_type = compute_type
         self.vad = vad
         self.min_words = min_words
         self.min_logprob = min_logprob
         self.max_compression_ratio = max_compression_ratio
         self.max_temperature = max_temperature
-        self.model = WhisperModel(model_id, device="cuda", compute_type=compute_type)
+        self.model = WhisperModel(model_id, device=device, compute_type=compute_type)
         self._warmup()
 
     def _warmup(self):

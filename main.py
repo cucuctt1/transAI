@@ -18,6 +18,7 @@ def parse_args():
     p.add_argument("--audio-buffer", type=float, default=7.0, help="rolling audio history length in seconds (default 7)")
     p.add_argument("--step", type=float, default=1, help="snapshot interval in seconds (default 1)")
     p.add_argument("--compute-type", default="int8", choices=["float16", "int8_float16", "int8"], help="CTranslate2 compute type")
+    p.add_argument("--device", default="cuda", choices=["cuda", "cpu"], help="inference device (default cuda)")
     p.add_argument("--vad", dest="vad", action="store_true", default=False, help="enable Silero VAD (default on)")
     p.add_argument("--no-vad", dest="vad", action="store_false", help="disable VAD")
     p.add_argument("--min-logprob", type=float, default=-1.0)
@@ -250,6 +251,7 @@ def _run_with_model(mode, args):
             min_logprob=args.min_logprob,
             max_compression_ratio=args.max_compression_ratio,
             max_temperature=args.max_temperature,
+            device=args.device,
         )
     except Exception as exc:
         print(f"[ERROR] Failed to load model: {exc}", file=sys.stderr, flush=True)
@@ -276,6 +278,7 @@ def run_headless_server(args):
             min_logprob=args.min_logprob,
             max_compression_ratio=args.max_compression_ratio,
             max_temperature=args.max_temperature,
+            device=args.device,
         )
     except Exception as exc:
         print(f"[ERROR] Failed to load model: {exc}", file=sys.stderr, flush=True)
