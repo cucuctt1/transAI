@@ -79,6 +79,11 @@ class ASREngine:
         self.inferences = 0
         self.rms_skipped = 0
         self.not_enough_audio = 0
+        self.jobs_taken = 0
+        self.stale_skipped = 0
+        self.first_inference_logged = False
+        self._inflight_start = 0.0
+        self._hang_reported = False
 
     def start(self):
         self._thread = threading.Thread(target=self._run, name="asr-engine", daemon=True)
@@ -136,27 +141,44 @@ class ASREngine:
                     next_t = time.monotonic()
 
         def whisper_loop():
-            while not self._stop.is_set():
-                job = scheduler.take()
-                if job is None:
-                    self._stop.wait(0.02)
-                    continue
-                if capture.live_position() - job.audio_end > self.cfg.backlog_latency:
-                    scheduler.skipped += 1
-                    continue
-                t0 = time.monotonic()
-                try:
-                    res = self.translator.translate(job.audio)
-                except Exception as exc:
-                    self.log_cb(f"[ERROR] inference failed: {exc}")
-                    res = None
-                dt = time.monotonic() - t0
-                self.inferences += 1
-                monitor.update(live=capture.live_position(), transcribed=job.audio_end,
-                               whisper_dur=dt, skipped=scheduler.skipped, pending=scheduler.pending_count)
-                if res is None:
-                    continue
-                whisper_q.put((res.text, job.audio_end, dt))
+            try:
+                while not self._stop.is_set():
+                    job = scheduler.take()
+                    if job is None:
+                        self._stop.wait(0.02)
+                        continue
+                    self.jobs_taken += 1
+                    if capture.live_position() - job.audio_end > self.cfg.backlog_latency:
+                        scheduler.skipped += 1
+                        self.stale_skipped += 1
+                        continue
+                    if not self.first_inference_logged:
+                        self.first_inference_logged = True
+                        a = job.audio
+                        self.log_cb(
+                            f"[ASR] first inference: samples={len(a)} dtype={a.dtype} "
+                            f"rms={float(np.sqrt(np.mean(a.astype(np.float64) ** 2))):.5f} "
+                            f"nan={bool(np.isnan(a).any())} maxabs={float(np.max(np.abs(a))):.4f}"
+                        )
+                    t0 = time.monotonic()
+                    self._inflight_start = t0
+                    self._hang_reported = False
+                    try:
+                        res = self.translator.translate(job.audio)
+                    except Exception as exc:
+                        self.log_cb(f"[ERROR] inference failed: {exc!r}")
+                        res = None
+                    finally:
+                        self._inflight_start = 0.0
+                    dt = time.monotonic() - t0
+                    self.inferences += 1
+                    monitor.update(live=capture.live_position(), transcribed=job.audio_end,
+                                   whisper_dur=dt, skipped=scheduler.skipped, pending=scheduler.pending_count)
+                    if res is None:
+                        continue
+                    whisper_q.put((res.text, job.audio_end, dt))
+            except Exception as exc:
+                self.log_cb(f"[ERROR] whisper thread died: {exc!r}")
 
         def fixer_loop():
             while not self._stop.is_set():
@@ -169,8 +191,20 @@ class ASREngine:
                 if corrected != unstable:
                     state.apply_fix(version, tokenize(corrected))
 
+        def watchdog_loop():
+            while not self._stop.is_set():
+                self._stop.wait(5.0)
+                start = self._inflight_start
+                if start and not self._hang_reported and time.monotonic() - start > 30.0:
+                    self._hang_reported = True
+                    self.log_cb(
+                        f"[ERROR] inference has been running for {time.monotonic() - start:.0f}s "
+                        f"- CTranslate2/CUDA appears hung on this device"
+                    )
+
         threading.Thread(target=snapshot_loop, name="snapshot", daemon=True).start()
         threading.Thread(target=whisper_loop, name="whisper", daemon=True).start()
+        threading.Thread(target=watchdog_loop, name="watchdog", daemon=True).start()
         if self.cfg.enable_background_fixer:
             threading.Thread(target=fixer_loop, name="fixer", daemon=True).start()
 
@@ -194,8 +228,9 @@ class ASREngine:
                 pipe_state = "ok" if avail >= self.cfg.whisper_window else "WAITING_FOR_AUDIO"
                 self.log_cb(
                     f"[PIPE] captured={live:.1f}s buffered={avail:.1f}s window={self.cfg.whisper_window:.1f}s "
-                    f"snapshots={self.snapshots_submitted} inferences={self.inferences} "
-                    f"rms_skipped={self.rms_skipped} not_enough_audio={self.not_enough_audio} -> {pipe_state}"
+                    f"snapshots={self.snapshots_submitted} jobs={self.jobs_taken} inferences={self.inferences} "
+                    f"rms_skipped={self.rms_skipped} stale_skipped={self.stale_skipped} "
+                    f"not_enough_audio={self.not_enough_audio} -> {pipe_state}"
                 )
                 last_pipe_t = now
 
