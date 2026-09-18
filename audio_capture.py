@@ -1,10 +1,10 @@
-import collections
 import math
 import threading
 
 import numpy as np
 import pyaudiowpatch as pyaudio
 from scipy.signal import resample_poly
+from streaming import AudioRing
 
 
 class AudioCapture:
@@ -22,14 +22,10 @@ class AudioCapture:
         self._pa = None
         self._stream = None
         self._consumer = None
-        self._buf = collections.deque(
-            maxlen=math.ceil(buffer_seconds / block_seconds) + 2
-        )
-        self._lock = threading.Lock()
         self._stop = threading.Event()
         self._thread = None
         self.device_name = ""
-        self._captured_frames = 0
+        self._ring = AudioRing(buffer_seconds)
 
     def set_consumer(self, callback):
         """Stream each resampled 16 kHz mono block to `callback` (e.g. a socket)."""
@@ -69,9 +65,16 @@ class AudioCapture:
         return resample_poly(audio, up, down).astype(np.float32)
 
     def start(self):
-        self._open_device()
+        if self._thread is not None and self._thread.is_alive():
+            return
+        self._stop.clear()
+        try:
+            self._open_device()
+        except Exception:
+            self._close_device()
+            raise
         self._thread = threading.Thread(
-            target=self._run, name="audio-capture", daemon=True
+            target=self._run, name="audio-capture", daemon=False
         )
         self._thread.start()
 
@@ -83,52 +86,47 @@ class AudioCapture:
                 block = np.frombuffer(data, dtype=np.float32)
                 if self.channels > 1:
                     block = block.reshape(-1, self.channels).mean(axis=1)
-                with self._lock:
-                    self._buf.append(block.astype(np.float32, copy=False))
-                    self._captured_frames += len(block)
+                # Resample each incoming block once, instead of resampling the
+                # whole overlapping window on every inference.
+                block = self._resample(block)
+                self._ring.feed(block)
                 if self._consumer is not None:
-                    self._consumer(self._resample(block.astype(np.float32)))
+                    self._consumer(block)
         except Exception as exc:
-            print(f"[Audio] capture error: {exc}")
+            if not self._stop.is_set():
+                print(f"[Audio] capture error: {exc}")
+        finally:
+            # Only the reader releases native resources after its read returns.
+            self._close_device()
 
     def available_seconds(self):
-        with self._lock:
-            total = sum(len(b) for b in self._buf)
-        return total / self.native_rate if self.native_rate else 0.0
+        return self._ring.available_seconds()
 
     def live_position(self):
         """Monotonic audio time (seconds) captured so far."""
-        with self._lock:
-            return self._captured_frames / self.native_rate if self.native_rate else 0.0
+        return self._ring.live_position()
 
     def latest(self, seconds):
         """Return (audio_16k_mono, audio_end_seconds) for the newest `seconds`, or None."""
-        if self.native_rate is None:
-            return None
-        n = int(seconds * self.native_rate)
-        with self._lock:
-            blocks = list(self._buf)
-            end = self._captured_frames / self.native_rate
-        if not blocks:
-            return None
-        audio = np.concatenate(blocks)
-        if len(audio) < n:
-            return None
-        return self._resample(audio[-n:]), end
+        return self._ring.latest(seconds)
 
     def stop(self):
         self._stop.set()
-        if self._thread is not None:
-            self._thread.join(timeout=2.0)
+        if self._thread is not None and self._thread is not threading.current_thread():
+            self._thread.join()
+
+    def _close_device(self):
         if self._stream is not None:
             try:
                 self._stream.stop_stream()
                 self._stream.close()
+                self._stream = None
             except Exception:
                 pass
         if self._pa is not None:
             try:
                 self._pa.terminate()
+                self._pa = None
             except Exception:
                 pass
 

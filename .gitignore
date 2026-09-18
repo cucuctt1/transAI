@@ -1,2 +1,6 @@
 /__pycache__/
 .kilo
+/models/
+/.runtime/
+/.cache/
+/.pytest_cache/

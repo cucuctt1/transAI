@@ -22,9 +22,9 @@ from dataclasses import dataclass
 
 @dataclass
 class Config:
-    whisper_window: float = 5.0
-    whisper_step: float = 1.0
-    audio_buffer: float = 7.0
+    whisper_window: float = 10.0
+    whisper_step: float = 2.0
+    audio_buffer: float = 20.0
     rollback_window: float = 3.0
     fixer_interval: float = 0.5
     fixer_context: float = 7.0
@@ -36,6 +36,37 @@ class Config:
     warning_latency: float = 1.0
     backlog_latency: float = 2.0
     words_per_second: float = 3.0  # rough rate used to bound the unstable region
+    endpoint_silence: float = 1.0
+    caption_timeout: float = 5.0
+    caption_max_words: int = 32
+    phrase_only: bool = False
+    commit_only: bool = False
+    commit_pause: float = 0.45
+    max_phrase_seconds: float = 30.0
+    enable_llm_fixer: bool = False
+    fixer_model: str = ""
+    fixer_cuda: bool = False
+    fixer_language: str = 'en'
+
+    def __post_init__(self):
+        if self.fixer_language not in ('en', 'ja'):
+            raise ValueError('Fixer language must be en or ja')
+        if self.fixer_cuda:
+            self.enable_llm_fixer = True
+        if self.commit_only:
+            self.phrase_only = True
+        if self.whisper_window <= 0 or self.whisper_step <= 0:
+            raise ValueError("Audio window and inference step must be positive")
+        if self.caption_timeout <= 0:
+            raise ValueError("Caption timeout must be positive")
+        if self.commit_pause <= 0 or self.commit_pause >= self.max_phrase_seconds:
+            raise ValueError("Commit pause must be positive and below the phrase limit")
+        self.audio_buffer = max(self.audio_buffer, self.whisper_window)
+        if self.endpoint_silence <= 0 or self.max_phrase_seconds <= self.endpoint_silence:
+            raise ValueError("Phrase limit must exceed the positive phrase pause duration")
+        if self.phrase_only:
+            # Keep a complete phrase plus audio arriving during its inference.
+            self.audio_buffer = max(self.audio_buffer, self.max_phrase_seconds + 15.0)
 
 
 # ---------------------------------------------------------------------------
@@ -255,11 +286,11 @@ class TranscriptState:
 # ---------------------------------------------------------------------------
 
 class BackgroundFixer:
-    """Correction layer for the unstable tail.
+    """Bounded deterministic cleanup; semantic corrections come from audio.
 
-    No LLM is bundled. Implement ``fix_unstable_transcript`` with an LLM later;
-    it must only dedupe / resolve drift / repair continuity -- never invent,
-    paraphrase, or translate. The default is a deterministic no-op.
+    Only obvious decoder loops (3+ consecutive multiword repetitions) are
+    collapsed. Two repeats and single-word emphasis are kept. No paraphrasing,
+    number edits, or guessed words are performed.
     """
 
     def __init__(self, interval=0.5, context_seconds=7.0):
@@ -267,7 +298,22 @@ class BackgroundFixer:
         self.context_seconds = context_seconds
 
     def fix_unstable_transcript(self, context, unstable_text):
-        return unstable_text
+        words = unstable_text.split()
+        # Longest phrases first; bound work even on a runaway model output.
+        words = words[:256]
+        for width in range(min(16, len(words) // 3), 2, -1):
+            i = 0
+            while i + 3 * width <= len(words):
+                phrase = [norm(w) for w in words[i:i + width]]
+                j = i + width
+                while ([norm(w) for w in words[j:j + width]] == phrase
+                       and j + width <= len(words)):
+                    j += width
+                if j - i >= 3 * width:
+                    del words[i + width:j]
+                i += 1
+        text = " ".join(words)
+        return re.sub(r"\s+([,.;:!?])", r"\1", text)
 
 
 # ---------------------------------------------------------------------------

@@ -10,9 +10,7 @@ Protocol (single full-duplex TCP connection):
   server -> client  caption:     {"type":"caption","text":"..."}\\n
 """
 
-import collections
 import json
-import math
 import os
 import socket
 import struct
@@ -22,6 +20,18 @@ import threading
 import time
 
 import numpy as np
+
+
+def _close_socket(sock):
+    if sock is not None:
+        try:
+            sock.shutdown(socket.SHUT_RDWR)
+        except OSError:
+            pass
+        try:
+            sock.close()
+        except OSError:
+            pass
 
 
 def get_lan_ip():
@@ -101,38 +111,22 @@ class NetworkAudioSource:
     SAMPLERATE = 16000
 
     def __init__(self, buffer_seconds=7.0, block_seconds=0.2):
+        from streaming import AudioRing
+        self._ring = AudioRing(buffer_seconds)
         self.buffer_seconds = buffer_seconds
         self.samplerate = self.SAMPLERATE
-        self._buf = collections.deque(maxlen=math.ceil(buffer_seconds / block_seconds) + 2)
-        self._lock = threading.Lock()
-        self._captured_frames = 0
 
     def feed(self, samples):
-        samples = np.asarray(samples, dtype=np.float32)
-        with self._lock:
-            self._buf.append(samples)
-            self._captured_frames += len(samples)
+        self._ring.feed(samples)
 
     def available_seconds(self):
-        with self._lock:
-            total = sum(len(b) for b in self._buf)
-        return total / self.samplerate
+        return self._ring.available_seconds()
 
     def live_position(self):
-        with self._lock:
-            return self._captured_frames / self.samplerate
+        return self._ring.live_position()
 
     def latest(self, seconds):
-        n = int(seconds * self.samplerate)
-        with self._lock:
-            blocks = list(self._buf)
-            end = self._captured_frames / self.samplerate
-        if not blocks:
-            return None
-        audio = np.concatenate(blocks)
-        if len(audio) < n:
-            return None
-        return np.ascontiguousarray(audio[-n:], dtype=np.float32), end
+        return self._ring.latest(seconds)
 
     def start(self):
         pass
@@ -154,6 +148,8 @@ class AudioCaptionServer:
         self._sock = None
         self._clients = set()
         self._audio_client = None
+        self._connections = set()
+        self._handlers = set()
         self._lock = threading.Lock()
         self._stop = threading.Event()
         self._thread = None
@@ -194,7 +190,22 @@ class AudioCaptionServer:
                     break
                 time.sleep(0.1)  # transient accept error (e.g. aborted probe) -> keep serving
                 continue
-            threading.Thread(target=self._handle, args=(conn,), daemon=True).start()
+            with self._lock:
+                self._connections.add(conn)
+                worker = threading.Thread(target=self._handle_tracked, args=(conn,), daemon=False)
+                self._handlers.add(worker)
+            worker.start()
+
+    def _handle_tracked(self, conn):
+        try:
+            self._handle(conn)
+        except OSError:
+            pass  # socket shutdown wakes handshake/audio reads
+        finally:
+            _close_socket(conn)
+            with self._lock:
+                self._connections.discard(conn)
+                self._handlers.discard(threading.current_thread())
 
     def _handle(self, conn):
         conn.settimeout(1.0)
@@ -257,17 +268,17 @@ class AudioCaptionServer:
 
     def stop(self):
         self._stop.set()
-        if self._sock is not None:
-            try:
-                self._sock.close()
-            except OSError:
-                pass
+        _close_socket(self._sock)
+        if self._thread is not None and self._thread is not threading.current_thread():
+            self._thread.join()
         with self._lock:
-            for c in self._clients:
-                try:
-                    c.close()
-                except OSError:
-                    pass
+            clients = list(self._connections)
+            handlers = list(self._handlers)
+        for c in clients:
+            _close_socket(c)
+        for worker in handlers:
+            worker.join()
+        with self._lock:
             self._clients.clear()
 
 
@@ -288,6 +299,7 @@ class StreamingClient:
         self._sock = None
         self._thread = None
         self.connected = False
+        self._stats_thread = None
         self.frames_sent = 0
         self.samples_sent = 0
         self.captions_received = 0
@@ -295,11 +307,11 @@ class StreamingClient:
     def start(self):
         self._thread = threading.Thread(target=self._run, daemon=True)
         self._thread.start()
-        threading.Thread(target=self._stats_loop, daemon=True).start()
+        self._stats_thread = threading.Thread(target=self._stats_loop, name='client-stats', daemon=False)
+        self._stats_thread.start()
 
     def _stats_loop(self):
-        while not self._stop.is_set():
-            self._stop.wait(2.0)
+        while not self._stop.wait(2.0):
             self.log_cb(
                 f"[CLIENT] connected={self.connected} audio_sent={self.samples_sent / 16000:.1f}s "
                 f"frames={self.frames_sent} captions={self.captions_received}"
@@ -307,11 +319,11 @@ class StreamingClient:
 
     def stop(self):
         self._stop.set()
-        if self._sock is not None:
-            try:
-                self._sock.close()
-            except OSError:
-                pass
+        self._ready.clear()
+        _close_socket(self._sock)
+        for worker in (self._thread, self._stats_thread):
+            if worker is not None and worker is not threading.current_thread():
+                worker.join()
 
     def send_audio(self, block):
         """Stream a 16 kHz mono float32 block to the server (called by the capturer)."""
@@ -377,8 +389,18 @@ class StreamingClient:
 class LocalServerLauncher:
     """Spawns a headless caption-server subprocess for "local" client mode."""
 
-    def __init__(self, port=8765, log_cb=None):
+    def __init__(self, port=8765, log_cb=None, extra_args=None):
         self.port = port
+        self.extra_args = list(extra_args or [])
+        # First Moonshine launch downloads two models and imports Transformers.
+        # Keep checking cancellation/process exit while allowing that cold start.
+        selected_backend = "faster-whisper"
+        for index, arg in enumerate(self.extra_args):
+            if arg.startswith("--backend="):
+                selected_backend = arg.split("=", 1)[1]
+            elif arg == "--backend" and index + 1 < len(self.extra_args):
+                selected_backend = self.extra_args[index + 1]
+        self.startup_timeout = 600 if selected_backend == "moonshine" else 60
         self.log_cb = log_cb or (lambda line: None)
         self.proc = None
         self.script = os.path.join(os.path.dirname(os.path.abspath(__file__)), "main.py")
@@ -392,18 +414,31 @@ class LocalServerLauncher:
             return False
 
     def ensure(self):
-        if self.is_up():
+        if self.proc is not None and self.proc.poll() is None and self.is_up():
             return True
+        if self.is_up():
+            # Never inherit mode/model options from an unrelated old server.
+            # Do not stop it: another client may still be using it.
+            with socket.socket() as listener:
+                listener.bind(("127.0.0.1", 0))
+                self.port = listener.getsockname()[1]
+            self.log_cb(f"[LOCAL] existing server left running; using private port {self.port}")
         self.log_cb(f"[LOCAL] starting headless server on port {self.port}...")
         try:
             self.proc = subprocess.Popen(
-                [sys.executable, self.script, "--server-headless", "--port", str(self.port)],
+                [sys.executable, self.script, *self.extra_args, "--server-headless", "--parent-control", "--port", str(self.port)],
                 cwd=os.path.dirname(self.script),
+                stdin=subprocess.PIPE,
+                creationflags=subprocess.CREATE_NO_WINDOW if os.name == 'nt' else 0,
             )
         except OSError as exc:
             self.log_cb(f"[LOCAL] failed to start server: {exc}")
             return False
-        for _ in range(120):
+        for _ in range(self.startup_timeout * 2):
+            import shutdown
+            if shutdown.requested.is_set():
+                self.stop()
+                return False
             if self.is_up():
                 self.log_cb("[LOCAL] server is up")
                 return True
@@ -411,16 +446,24 @@ class LocalServerLauncher:
                 self.log_cb(f"[LOCAL] server exited early (code {self.proc.returncode})")
                 return False
             time.sleep(0.5)
+        self.stop()
         return False
 
     def stop(self):
         if self.proc is not None and self.proc.poll() is None:
             try:
-                self.proc.terminate()
-                self.proc.wait(timeout=5)
-            except Exception:
-                try:
-                    self.proc.kill()
-                except Exception:
-                    pass
+                self.proc.stdin.write(b'STOP\n')
+                self.proc.stdin.flush()
+            except (OSError, ValueError):
+                pass
+            finally:
+                if self.proc.stdin is not None:
+                    try:
+                        self.proc.stdin.close()
+                    except OSError:
+                        pass
+            self.log_cb('[LOCAL] waiting for server inference and cleanup...')
+            self.proc.wait()
+        elif self.proc is not None and self.proc.stdin is not None:
+            self.proc.stdin.close()
         self.proc = None

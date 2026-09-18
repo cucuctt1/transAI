@@ -1,0 +1,6 @@
+# Optional Windows-native backend. Install alongside requirements.txt.
+# Requires an existing torch >=2.6; deliberately do NOT install/upgrade torch.
+# Keep your existing CUDA-enabled torch build; no CTranslate2 dependency here.
+transformers==5.2.0
+sentencepiece>=0.2,<0.3
+sacremoses>=0.1,<0.2

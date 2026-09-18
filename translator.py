@@ -2,6 +2,9 @@ import os
 import re
 import site
 import sys
+from model_storage import configure
+
+_MODELS = configure()
 from dataclasses import dataclass, field
 
 import numpy as np
@@ -11,7 +14,8 @@ try:
 except Exception:
     torch = None
 
-_LETTER = re.compile(r"[A-Za-z]")
+_LETTER = re.compile(r"[A-Za-z0-9]")
+_SPACE = re.compile(r"\s+")
 
 # --- CUDA runtime resolution for CTranslate2 ---------------------------------
 # faster-whisper's backend (CTranslate2) is a CUDA-12 build: it loads
@@ -136,6 +140,8 @@ class Translator:
         max_compression_ratio=2.4,
         max_temperature=1.0,
         device="cuda",
+        beam_size=5,
+        translation_prompt="",
     ):
         self.model_id = model_id
         self.device = device
@@ -147,7 +153,13 @@ class Translator:
         self.min_logprob = min_logprob
         self.max_compression_ratio = max_compression_ratio
         self.max_temperature = max_temperature
-        self.model = WhisperModel(model_id, device=device, compute_type=compute_type)
+        self.beam_size = max(1, beam_size)
+        # This model uses the language token as the *target* language for
+        # translation. Keep this prompt short: it is terminology guidance, not
+        # rolling caption context (rolling context is a common source of loops).
+        self.translation_prompt = self._clean_prompt(translation_prompt)
+        self.model = WhisperModel(model_id, device=device, compute_type=compute_type,
+                                  download_root=str(_MODELS / 'whisper'))
         self._warmup()
 
     def _warmup(self):
@@ -158,9 +170,11 @@ class Translator:
                 np.zeros(16000, dtype=np.float32),
                 language="en",
                 task="translate",
-                beam_size=1,
+                beam_size=self.beam_size,
                 condition_on_previous_text=False,
-                vad_filter=self.vad,
+                vad_filter=False,  # silent VAD input skips GPU warm-up entirely
+                temperature=0.0,
+                no_speech_threshold=0.6,
             )
             for _ in segments:
                 pass
@@ -181,17 +195,36 @@ class Translator:
             return True
         if seg.temperature is not None and seg.temperature >= self.max_temperature:
             return True
+        # Use the configured probability threshold above. The old additional
+        # -0.5 cutoff silently discarded otherwise accepted quiet speech.
         return False
 
-    def translate(self, audio, prompt=None):
+    @staticmethod
+    def _clean_prompt(prompt):
+        """Normalize and bound user terminology before it reaches the decoder."""
+        prompt = _SPACE.sub(" ", (prompt or "").strip())
+        return prompt[:400]
+
+    def translate(self, audio, prompt=None, beam_size=None):
         audio = np.asarray(audio, dtype=np.float32)
         kwargs = dict(
             language="en",
             task="translate",
-            beam_size=1,
+            # Beam search produces a more stable best translation than the old
+            # greedy decoder. A fixed zero temperature prevents fallback
+            # sampling from changing names or terminology between live updates.
+            beam_size=self.beam_size if beam_size is None else max(1, beam_size),
+            temperature=0.0,
             condition_on_previous_text=False,
             vad_filter=self.vad,
+            vad_parameters={"min_silence_duration_ms": 350},
+            no_speech_threshold=0.6,
+            log_prob_threshold=self.min_logprob,
+            compression_ratio_threshold=self.max_compression_ratio,
+            # Hard n-gram bans also remove legitimate repeated speech. Handle
+            # display duplication after decoding, with temporal context.
         )
+        prompt = self._clean_prompt(prompt) or self.translation_prompt
         if prompt:
             kwargs["initial_prompt"] = prompt
 

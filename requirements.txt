@@ -1,5 +1,6 @@
 # Full install (server side: Whisper + CUDA + GUI).
 # For the lightweight client only, use: pip install -r requirements-client.txt
+# Optional Moonshine + Japanese-to-English MT: pip install -r requirements-moonshine.txt
 faster-whisper
 PyAudioWPatch
 numpy

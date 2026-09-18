@@ -8,9 +8,10 @@ import random
 import string
 import sys
 import threading
+import time
 
 from PyQt5.QtCore import QObject, QPoint, QRect, Qt, QTimer, pyqtSignal
-from PyQt5.QtGui import QColor, QFont, QFontMetrics, QPainter
+from PyQt5.QtGui import QColor, QFont, QFontMetrics, QPainter, QPen
 from PyQt5.QtWidgets import (
     QApplication,
     QComboBox,
@@ -78,6 +79,8 @@ class CaptionOverlay(QWidget):
         self.controller = controller
         self.settings = settings
         self._caption = ""
+        self._history = ""
+        self._history_started = 0.0
         self._lines = [""]
         self._paused = False
         self._dragging = False
@@ -118,7 +121,7 @@ class CaptionOverlay(QWidget):
     def _place(self):
         screen = QApplication.primaryScreen().availableGeometry()
         w = self.settings.caption_width
-        ref_h = self._single_line_height()
+        ref_h = self.height()
         m = self.settings.margin
         pos = self.settings.position
         if pos == "custom" and self._custom_pos is not None:
@@ -141,11 +144,17 @@ class CaptionOverlay(QWidget):
     # ---- caption polling (latest-wins + dedup) ----------------------------
 
     def _poll(self):
+        if self._history:
+            if time.monotonic() - self._history_started >= 4.0:
+                self._history = ''
+            self.update()
         text = self.controller.take()
         if text is None or self._paused:
             return
         if text == self._caption:
             return
+        self._history = ' '.join(self._caption.split()) if text else ''
+        self._history_started = time.monotonic()
         self._caption = text
         self._relayout()
 
@@ -154,6 +163,7 @@ class CaptionOverlay(QWidget):
 
     def clear_caption(self):
         self._caption = ""
+        self._history = ""
         self._relayout()
 
     # ---- layout / painting -------------------------------------------------
@@ -163,6 +173,7 @@ class CaptionOverlay(QWidget):
         if not self._caption:
             self._lines = [""]
             self.setFixedSize(self.settings.caption_width, self._single_line_height())
+            self._place()
             if self.settings.hide_until_caption:
                 self.hide()
             else:
@@ -173,8 +184,13 @@ class CaptionOverlay(QWidget):
         avail = self.settings.caption_width - 2 * self.settings.padding
         self._lines = self._wrap(self._caption, fm, avail)
         text_h = len(self._lines) * fm.lineSpacing()
-        self.setFixedSize(self.settings.caption_width, text_h + 2 * self.settings.padding)
+        # Reserve a stable one-line history slot so fading never resizes/jumps.
+        self.setFixedSize(self.settings.caption_width, text_h + self._history_height() + 2 * self.settings.padding)
+        self._place()
         self.update()
+
+    def _history_height(self):
+        return int(QFontMetrics(self._font).lineSpacing() * .8) + 6
 
     @staticmethod
     def _wrap(text, fm, avail):
@@ -201,12 +217,31 @@ class CaptionOverlay(QWidget):
         p.setBrush(bg)
         p.setPen(Qt.NoPen)
         p.drawRoundedRect(self.rect(), 12, 12)
-        p.setPen(QColor(self.settings.text_color))
+        p.setPen(QPen(QColor(self.settings.text_color)))
         p.setFont(self._font)
         fm = QFontMetrics(self._font)
         pad = self.settings.padding
-        y = pad + fm.ascent()
+        y = pad + self._history_height() + fm.ascent()
         align = self.settings.text_alignment
+        if self._history:
+            age = max(0.0, time.monotonic() - self._history_started)
+            progress = min(1.0, age / .45)
+            eased = 1 - (1 - progress) ** 3
+            fade = max(0.0, min(1.0, (4.0 - age) / 1.2))
+            font = QFont(self._font)
+            font.setPointSizeF(max(1, self._font.pointSizeF() * (.9 - .25 * eased)))
+            history_fm = QFontMetrics(font)
+            line = history_fm.elidedText(self._history, Qt.ElideRight,
+                                         self.width() - 2 * pad)
+            width = history_fm.horizontalAdvance(line)
+            hx = ((self.width() - width) // 2 if align == 'center' else
+                  self.width() - pad - width if align == 'right' else pad)
+            hy = pad + history_fm.ascent() + int((1 - eased) * self._history_height())
+            p.save()
+            p.setOpacity((.65 - .25 * eased) * fade)
+            p.setFont(font)
+            p.drawText(hx, hy, line)
+            p.restore()
         for line in self._lines:
             lw = fm.horizontalAdvance(line)
             if align == "center":
@@ -242,6 +277,10 @@ class CaptionOverlay(QWidget):
         if e.key() == Qt.Key_Escape and self.settings.esc_closes:
             self.request_close.emit()
 
+    def closeEvent(self, event):
+        event.ignore()
+        self.request_close.emit()
+
     def _show_menu(self, global_pos):
         menu = QMenu(self)
         menu.addAction("Show Main Window", self.request_show_main.emit)
@@ -254,8 +293,13 @@ class CaptionOverlay(QWidget):
 
 
 class MainWindow(QMainWindow):
+    close_requested = pyqtSignal()
     run_clicked = pyqtSignal()
     stop_server_clicked = pyqtSignal()
+
+    def closeEvent(self, event):
+        event.ignore()
+        self.close_requested.emit()
 
     def __init__(self, settings, mode="local"):
         super().__init__()
@@ -449,19 +493,21 @@ class ConnectionController(QObject):
         log_cb(f"[CLIENT] capturing: {self.capture.device_name}")
         return self.client
 
-    def start_server(self, cfg, translator, gpu_name, code, log_cb):
+    def start_server(self, cfg, translator, gpu_name, code, log_cb, **engine_options):
         from asr_engine import ASREngine  # lazy import (torch already loaded by caller)
         from server import AudioCaptionServer, NetworkAudioSource, get_lan_ip
         self.audio_source = NetworkAudioSource(buffer_seconds=cfg.audio_buffer)
         self.server = AudioCaptionServer(self.audio_source, pairing_code=code, log_cb=log_cb)
         self.server.start()
         self.asr = ASREngine(cfg, translator, gpu_name, self.audio_source,
-                             caption_cb=self.server.broadcast, log_cb=log_cb, status_cb=log_cb)
+                             caption_cb=self.server.broadcast, log_cb=log_cb, status_cb=log_cb,
+                             **engine_options)
         self.asr.start()
         return self.server, get_lan_ip()
 
     def stop(self):
-        for obj in (self.asr, self.client, self.server):
+        # Disconnect network first so a blocked capture send/inference broadcast wakes.
+        for obj in (self.client, self.server, self.asr):
             if obj is not None:
                 try:
                     obj.stop()
@@ -477,11 +523,16 @@ class ConnectionController(QObject):
 
 
 class App(QObject):
-    def __init__(self, mode="local", translator=None, gpu_name=None):
+    shutdown_finished = pyqtSignal()
+    def __init__(self, mode="local", translator=None, gpu_name=None, cfg=None,
+                 server_args=None, **engine_options):
         super().__init__()
         self.mode = mode  # local | server | client
         self.translator = translator
         self.gpu_name = gpu_name
+        self.pipeline_cfg = cfg or Config()
+        self.engine_options = engine_options
+        self.server_args = server_args or []
         self.settings = Settings.load()
         if mode == "server":
             self.settings.connection_mode = "local"
@@ -492,6 +543,12 @@ class App(QObject):
         self._server_running = False
         self._pairing_code = ""
         self.launcher = None
+        self._closing = False
+        self._shutdown_thread = None
+        self._cleanup_lock = threading.Lock()
+        self._cleaned = False
+        self.main_window.close_requested.connect(self.request_shutdown)
+        self.shutdown_finished.connect(QApplication.instance().quit)
 
         self.main_window.run_clicked.connect(self.on_run)
         self.main_window.stop_server_clicked.connect(self.on_stop_server)
@@ -508,13 +565,34 @@ class App(QObject):
         if mode == "server" and gpu_name:
             self.main_window.set_server_status(False, gpu=gpu_name)
 
-        import atexit
-        atexit.register(self._shutdown)
-
     def _shutdown(self):
-        self.connection.stop()
-        if self.launcher is not None:
-            self.launcher.stop()
+        with self._cleanup_lock:
+            if self._cleaned:
+                return
+            self.connection.stop()
+            if self.launcher is not None:
+                self.launcher.stop()
+            self._cleaned = True
+
+    def request_shutdown(self):
+        if self._closing:
+            return
+        self._closing = True
+        self._status_timer.stop()
+        self.overlay._timer.stop()
+        self.overlay.hide()
+        self.main_window.show()
+        self.main_window.run_button.setEnabled(False)
+        if hasattr(self.main_window, 'stop_button'):
+            self.main_window.stop_button.setEnabled(False)
+        self.main_window.set_status('Closing... waiting for active inference to finish')
+
+        def cleanup():
+            self._shutdown()
+            self.shutdown_finished.emit()
+
+        self._shutdown_thread = threading.Thread(target=cleanup, name='app-shutdown', daemon=False)
+        self._shutdown_thread.start()
 
     # ---- state machine -----------------------------------------------------
 
@@ -523,6 +601,8 @@ class App(QObject):
         self.main_window.show()
 
     def on_run(self):
+        if self._closing:
+            return
         self.main_window.collect_settings(self.settings)
         self.settings.save()
         self.overlay.apply_settings(self.settings)
@@ -538,7 +618,7 @@ class App(QObject):
             if self.mode == "server":
                 self._pairing_code = self.settings.pairing_code  # empty = no auth
                 self.connection.start_server(self._cfg(), self.translator, self.gpu_name,
-                                             self._pairing_code, log_cb)
+                                             self._pairing_code, log_cb, **self.engine_options)
                 self._server_running = True
                 self.main_window.set_server_status(True, clients=0, gpu=self.gpu_name or "loading...")
             elif self.settings.connection_mode == "lan":
@@ -551,11 +631,11 @@ class App(QObject):
             else:  # local: auto-spawn a headless server, then connect (thin client)
                 from server import LocalServerLauncher
                 if self.launcher is None:
-                    self.launcher = LocalServerLauncher(8765, log_cb=log_cb)
+                    self.launcher = LocalServerLauncher(8765, log_cb=log_cb, extra_args=self.server_args)
                 if not self.launcher.ensure():
                     self.main_window.set_status("Could not start local server")
                     return
-                self.connection.start_client("127.0.0.1", 8765, self.settings.pairing_code,
+                self.connection.start_client("127.0.0.1", self.launcher.port, self.settings.pairing_code,
                                              self.main_window.selected_audio_index(), log_cb)
                 self.main_window.hide()
                 self.overlay.show()
@@ -569,10 +649,13 @@ class App(QObject):
         self.main_window.set_server_status(False)
 
     def on_close_transcript(self):
-        self.overlay.hide()
-        self.main_window.show()
+        self.request_shutdown()
 
     def _refresh_server_status(self):
+        import shutdown
+        if shutdown.requested.is_set():
+            self.request_shutdown()
+            return
         if self.mode == "server" and self._server_running:
             server = self.connection.server
             clients = server.client_count if server else 0
@@ -581,22 +664,29 @@ class App(QObject):
                 gpu = self.connection.asr.gpu_name or gpu
             self.main_window.set_server_status(True, clients=clients, gpu=gpu)
 
-    @staticmethod
-    def _cfg():
-        return Config()  # default 5s window / 1s step / 3s rollback
+    def _cfg(self):
+        return self.pipeline_cfg
 
 
-def run_app(mode, translator=None, gpu_name=None):
+def run_app(mode, translator=None, gpu_name=None, cfg=None, server_args=None, **engine_options):
     app = QApplication.instance() or QApplication([])
     app.setQuitOnLastWindowClosed(False)
-    controller = App(mode, translator=translator, gpu_name=gpu_name)
+    controller = App(mode, translator=translator, gpu_name=gpu_name, cfg=cfg,
+                     server_args=server_args, **engine_options)
     controller.show_main()
-    app.exec_()
+    # Also handle explicit app.quit() and Ctrl+C without relying on atexit.
+    app.aboutToQuit.connect(controller._shutdown)
+    try:
+        app.exec_()
+    finally:
+        controller._shutdown()
+        if controller._shutdown_thread is not None:
+            controller._shutdown_thread.join()
 
 
-def run_client():
-    run_app("client")
+def run_client(server_args=None):
+    run_app("client", server_args=server_args)
 
 
-def run_server(translator=None, gpu_name=None):
-    run_app("server", translator, gpu_name)
+def run_server(translator=None, gpu_name=None, cfg=None, **engine_options):
+    run_app("server", translator, gpu_name, cfg=cfg, **engine_options)
